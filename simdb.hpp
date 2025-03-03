@@ -1521,7 +1521,7 @@ struct  SharedMem
   static const int alignment = 0;
   
   #ifdef _WIN32
-    void*      fileHndl;
+  HANDLE      mapHndl;    
   #elif defined(__APPLE__) || defined(__MACH__) || defined(__unix__) || defined(__FreeBSD__) // || defined(__linux__) ?    // osx, linux and freebsd
     int        fileHndl;
   #endif
@@ -1534,7 +1534,7 @@ struct  SharedMem
 
   void mv(SharedMem&& rval)
   {
-    fileHndl = rval.fileHndl;
+    mapHndl = rval.mapHndl;
     hndlPtr = rval.hndlPtr;
     ptr = rval.ptr;
     size = rval.size;
@@ -1552,8 +1552,8 @@ public:
       if(sm.hndlPtr){
         UnmapViewOfFile(sm.hndlPtr);
       }
-      if(sm.fileHndl){
-        CloseHandle(sm.fileHndl);
+      if(sm.mapHndl){
+        CloseHandle(sm.mapHndl);
       }
     #elif defined(__APPLE__) || defined(__MACH__) || defined(__unix__) || defined(__FreeBSD__) || defined(__linux__)     // osx, linux and freebsd
       if(sm.hndlPtr){
@@ -1565,7 +1565,7 @@ public:
 
     sm.clear();
   }
-  static SharedMem  AllocAnon(const char* name, u64 sizeBytes, bool raw_path=false, simdb_error* error_code=nullptr)
+  static SharedMem  AllocAnon(const char* name, u64 sizeBytes, simdb_error* error_code=nullptr)
   {
     using namespace std;
 
@@ -1577,55 +1577,52 @@ public:
     if(error_code){ *error_code = simdb_error::NO_ERRORS; }
 
     #ifdef _WIN32      // windows
-      sm.fileHndl = nullptr;
-      if(!raw_path){ strcpy(sm.path, "simdb_"); }
+      std::string dbName = std::string("simdb_") + name;
+      sm.mapHndl = nullptr;
     #elif defined(__APPLE__) || defined(__MACH__) || defined(__unix__) || defined(__FreeBSD__) || defined(__linux__)  // osx, linux and freebsd
       sm.fileHndl = 0;
-      strcpy(sm.path, P_tmpdir "/simdb_");
+      sm.mapHndl = 0;
+      if (!db_path) 
+      {
+          strcpy(sm.path, P_tmpdir "/");
+          strcat(sm.path, dbName.c_str());
+      }
     #endif
 
-    u64 len = strlen(sm.path) + strlen(name);
-    if(len > sizeof(sm.path)-1){
-      *error_code = simdb_error::PATH_TOO_LONG;
-      return move(sm);
-    }else{ strcat(sm.path, name); }
+    //u64 len = strlen(sm.path) + strlen(name);
+    //if(len > sizeof(sm.path)-1){
+    //  *error_code = simdb_error::PATH_TOO_LONG;
+    //  return move(sm);
+    //}else{ strcat(sm.path, name); }
 
     #ifdef _WIN32      // windows
-      if(raw_path)
+      sm.mapHndl = OpenFileMappingA(FILE_MAP_READ | FILE_MAP_WRITE, FALSE, dbName.c_str());
+      if(sm.mapHndl ==NULL || sm.mapHndl == INVALID_HANDLE_VALUE)
       {
-        sm.fileHndl = CreateFileA(
-          sm.path, 
-          GENERIC_READ|GENERIC_WRITE,   //FILE_MAP_READ|FILE_MAP_WRITE,  // apparently FILE_MAP constants have no effects here
-          FILE_SHARE_READ|FILE_SHARE_WRITE, 
-          NULL,
-          CREATE_NEW,
-          FILE_ATTRIBUTE_NORMAL,        //_In_ DWORD dwFlagsAndAttributes
-          NULL                          //_In_opt_ HANDLE hTemplateFile
-        );
-      }
-      sm.fileHndl = OpenFileMappingA(FILE_MAP_READ | FILE_MAP_WRITE, FALSE, sm.path);
-
-      if(sm.fileHndl==NULL)
-      {
-        sm.fileHndl = CreateFileMappingA(  // todo: simplify and call this right away, it will open the section if it already exists
+        sm.mapHndl = CreateFileMappingA(  // todo: simplify and call this right away, it will open the section if it already exists
           INVALID_HANDLE_VALUE,
           NULL,
           PAGE_READWRITE,
           0,
           (DWORD)sizeBytes,
-          sm.path);
-        if(sm.fileHndl!=NULL){ sm.owner=true; }
+          name);
+		if (sm.mapHndl != NULL && sm.mapHndl != INVALID_HANDLE_VALUE)
+        { 
+            sm.owner=true; 
+        }
       }
       
-      if(sm.fileHndl != nullptr){
-        sm.hndlPtr = MapViewOfFile(sm.fileHndl,   // handle to map object
+      if(sm.mapHndl != NULL && sm.mapHndl != INVALID_HANDLE_VALUE)
+      {
+        sm.hndlPtr = MapViewOfFile(sm.mapHndl,   // handle to map object
           FILE_MAP_READ | FILE_MAP_WRITE, // FILE_MAP_ALL_ACCESS,   // read/write permission
           0,
           0,
           0);
       }
 
-      if(sm.hndlPtr==nullptr){ 
+      if(sm.hndlPtr == NULL || sm.mapHndl == INVALID_HANDLE_VALUE)
+      {
         int      err = (int)GetLastError();
         LPSTR msgBuf = nullptr;
         /*size_t msgSz =*/ FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
@@ -1633,7 +1630,7 @@ public:
         win_printf("simdb initialization error: %d - %s", err, msgBuf);
         LocalFree(msgBuf);
 
-        CloseHandle(sm.fileHndl); 
+        CloseHandle(sm.mapHndl);
         sm.clear(); 
         return move(sm); 
       }
@@ -1687,6 +1684,7 @@ public:
   }
 
   SharedMem() :
+    mapHndl(nullptr),
     hndlPtr(nullptr),
     ptr(nullptr),
     size(0),
@@ -1706,7 +1704,7 @@ public:
   }
   void clear()
   {
-    fileHndl  =  (decltype(fileHndl))0;
+    mapHndl  =  (decltype(mapHndl))0;
     hndlPtr   =  nullptr;
     ptr       =  nullptr;
     size      =  0;
@@ -1801,59 +1799,79 @@ public:
     s_blockSize(nullptr),
     s_blockCount(nullptr)
   {}
-  simdb(const char* name, u32 blockSize, u32 blockCount, bool raw_path=false) : 
+  simdb(const char* name, u32 blockSize, u32 blockCount) :
     m_nxtChIdx(0),
     m_curChIdx(0),
     m_isOpen(false)
   {
-    simdb_error error_code = simdb_error::NO_ERRORS;
-    new (&m_mem) SharedMem( SharedMem::AllocAnon(name, MemSize(blockSize,blockCount), raw_path, &error_code) );
-
-    if(error_code!=simdb_error::NO_ERRORS){ m_error = error_code; return; }
-    if(!m_mem.hndlPtr){ m_error = simdb_error::SHARED_MEMORY_ERROR; return; }
-
-    //  flags     blockSize
-    // |----|----|--------|--------|     each dash ('-') represents one byte - flags is the first four, cnt is the next 4, blockSize is the next 8, blockCount is the 8 bytes after that
-    //       cnt           blockCount
-    s_blockCount  =  ((au64*)m_mem.data())+2;
-    s_blockSize   =  ((au64*)m_mem.data())+1;      // 8 byte offset to be after flags and cnt 
-    s_flags       =   (au32*)m_mem.data();
-    s_cnt         =  ((au32*)m_mem.data())+1;
-
-    if(isOwner()){
-      s_blockCount->store(blockCount);
-      s_blockSize->store(blockSize);
-      s_cnt->store(1);
-    }else{
-      #if defined(_WIN32)                                          // do we need to spin until ready on windows? unix has file locks built in to the system calls
-        //while(s_flags->load()<1){continue;}
-      #endif
-      s_cnt->fetch_add(1);
-      m_mem.size = MemSize(s_blockSize->load(), s_blockCount->load());
-    }
-
-    //auto cncrHashSize = CncrHsh::sizeBytes(blockCount);
-    uint64_t cncrHashSize = CncrHsh::sizeBytes((u32)s_blockCount->load());
-    new (&s_cs) CncrStr( ((u8*)m_mem.data())+cncrHashSize+OffsetBytes(), 
-                                 (u32)s_blockSize->load(), 
-                                 (u32)s_blockCount->load(), 
-                                 m_mem.owner);
-
-    new (&s_ch) CncrHsh( ((u8*)m_mem.data())+OffsetBytes(), 
-                                (u32)s_blockCount->load(),
-                                &s_cs,                          // the address of the CncrStr
-                                m_mem.owner);
-
-    m_blkCnt = s_blockCount->load();
-    m_blkSz  = s_blockSize->load();
-    m_isOpen = true;
-
-    if(isOwner()){ s_flags->store(1); }
+      init(name, blockSize, blockCount);
   }
   ~simdb(){ close(); }
 
   simdb(simdb&& rval){ mv(std::move(rval)); }
   simdb& operator=(simdb&& rval){ mv(std::move(rval)); return *this; }
+
+  bool init(const char* name, u32 blockSize, u32 blockCount)
+  {
+      simdb_error error_code = simdb_error::NO_ERRORS;
+      new (&m_mem) SharedMem(SharedMem::AllocAnon(name, MemSize(blockSize, blockCount), &error_code));
+
+      if (error_code != simdb_error::NO_ERRORS) 
+      { 
+          m_error = error_code; 
+          return false; 
+      }
+      if (!m_mem.hndlPtr) 
+      { 
+          m_error = simdb_error::SHARED_MEMORY_ERROR;
+          return false; 
+      }
+
+      //  flags     blockSize
+      // |----|----|--------|--------|     each dash ('-') represents one byte - flags is the first four, cnt is the next 4, blockSize is the next 8, blockCount is the 8 bytes after that
+      //       cnt           blockCount
+      s_blockCount =    ((au64*)m_mem.data()) + 2;
+      s_blockSize =     ((au64*)m_mem.data()) + 1;      // 8 byte offset to be after flags and cnt 
+      s_flags =         (au32*)m_mem.data();
+      s_cnt =           ((au32*)m_mem.data()) + 1;
+
+      if (isOwner()) 
+      {
+          s_blockCount->store(blockCount);
+          s_blockSize->store(blockSize);
+          s_cnt->store(1);
+      }
+      else 
+      {
+#if defined(_WIN32)                                          // do we need to spin until ready on windows? unix has file locks built in to the system calls
+          //while(s_flags->load()<1){continue;}
+#endif
+          s_cnt->fetch_add(1);
+          m_mem.size = MemSize(s_blockSize->load(), s_blockCount->load());
+      }
+
+      //auto cncrHashSize = CncrHsh::sizeBytes(blockCount);
+      uint64_t cncrHashSize = CncrHsh::sizeBytes((u32)s_blockCount->load());
+      new (&s_cs) CncrStr(((u8*)m_mem.data()) + cncrHashSize + OffsetBytes(),
+          (u32)s_blockSize->load(),
+          (u32)s_blockCount->load(),
+          m_mem.owner);
+
+      new (&s_ch) CncrHsh(((u8*)m_mem.data()) + OffsetBytes(),
+          (u32)s_blockCount->load(),
+          &s_cs,                          // the address of the CncrStr
+          m_mem.owner);
+
+      m_blkCnt = s_blockCount->load();
+      m_blkSz = s_blockSize->load();
+      m_isOpen = true;
+
+      if (isOwner()) 
+      { 
+          s_flags->store(1); 
+      }
+      return true;
+  }
 
   i64          len(const void *const key, u32 klen, u32* out_vlen=nullptr, u32* out_version=nullptr) const
   {
@@ -1891,12 +1909,12 @@ public:
     return put(key, (u32)strlen(key), val, vlen, out_startBlock);
   }
 
-  void       flush() const
-  {
-    #ifdef _WIN32
-      FlushViewOfFile(m_mem.hndlPtr, m_mem.size);
-    #endif
-  }
+  //bool       flush() const
+  //{
+  //  #ifdef _WIN32
+  //    return (FlushViewOfFile(m_mem.hndlPtr, m_mem.size) == TRUE);
+  //  #endif
+  //}
   VerIdx       nxt() const                                                                  // this version index represents a hash index, not an block storage index
   {    
     VerIdx ret = s_ch.empty_vi();
